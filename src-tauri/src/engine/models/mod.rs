@@ -41,6 +41,7 @@ mod claude;
 mod codex;
 mod grok;
 mod kimi;
+mod minimax;
 mod opencode;
 mod pi;
 mod qoder;
@@ -176,6 +177,14 @@ pub async fn list_engine_models(
         "opencode" => Ok(opencode_catalog().await),
         "qoder" => qoder_catalog("qoder").await,
         "qoder-cn" => qoder_catalog("qoder-cn").await,
+        // MiniMax's catalog mirrors the CLI's /model menu but is not
+        // authoritative (new models ship faster than this list); the ACP
+        // driver resolves each pick against the session's own options.
+        "minimax" => Ok(EngineCatalog {
+            models: minimax::minimax_local_models(),
+            authoritative: false,
+            remote: false,
+        }),
         // Unknown engine: no CLI-sourced catalog — the frontend fills the
         // picker from the configured provider channels.
         _ => Ok(EngineCatalog::authoritative(Vec::new())),
