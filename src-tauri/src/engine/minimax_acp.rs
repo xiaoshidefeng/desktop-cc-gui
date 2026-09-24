@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
@@ -40,6 +41,22 @@ use super::qoder_session::{
     SESSION_NEW_TIMEOUT, SESSION_RESUME_TIMEOUT,
 };
 use super::{BuiltCommand, Engine, EngineEvent, SendRequest, TurnCore, TurnState, VirtualRunGuard};
+
+/// Model catalog probe budget: a temp-dir session/new skips any workspace
+/// scan, so the handshake lands in seconds; the cap is pure slow-machine
+/// headroom (same convention as the qoder probe).
+const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const MODEL_PROBE_TOTAL: Duration = Duration::from_secs(20);
+
+/// One model row from the session's own `model` config option, resolved to
+/// the picker's `provider/model` id. `is_default` marks the option the
+/// session booted with (the CLI's configured default), which leads the list.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProbeModel {
+    pub id: String,
+    pub name: Option<String>,
+    pub is_default: bool,
+}
 
 /// Per-turn projection state: usage from the prompt result (the Done payload)
 /// and the tool names seen at tool_call start, so a later name-less
@@ -660,6 +677,98 @@ fn prompt_usage(result: &Value) -> Option<Value> {
     Some(Value::Object(usage))
 }
 
+/// Live model catalog via a throwaway `mcode acp` handshake in the temp
+/// dir (session/new there skips any workspace scan). The caller caches the
+/// last success; failures degrade to an error so it can fall back.
+pub(crate) async fn probe_models(bin: &str) -> Result<Vec<ProbeModel>, String> {
+    let cwd = std::env::temp_dir();
+    let killed = AtomicBool::new(false);
+    let probe = async {
+        let mut command = super::command_for_binary(bin);
+        command.arg("acp");
+        let mut spawned = spawn_piped_acp(&mut command, "minimax", &cwd)?;
+        let inner = probe_handshake(&mut spawned.acp, &killed).await;
+        teardown(&mut spawned.child).await;
+        inner
+    };
+    tokio::time::timeout(MODEL_PROBE_TOTAL, probe)
+        .await
+        .map_err(|_| "minimax model probe timed out".to_string())?
+}
+
+async fn probe_handshake(
+    acp: &mut AcpProcess,
+    killed: &AtomicBool,
+) -> Result<Vec<ProbeModel>, String> {
+    acp.routed(
+        "initialize",
+        initialize_params(),
+        RPC_HANDSHAKE_TIMEOUT,
+        killed,
+        None,
+        &mut |_| None,
+    )
+    .await?;
+    let session_result = acp
+        .routed(
+            "session/new",
+            json!({ "cwd": std::env::temp_dir().to_string_lossy(), "mcpServers": [] }),
+            MODEL_PROBE_TIMEOUT,
+            killed,
+            None,
+            &mut |_| None,
+        )
+        .await?;
+    Ok(models_from_config_options(&session_result))
+}
+
+/// Group the session's `model` config options into picker rows: variant
+/// entries (`m:<provider>:<model>:v:<variant>`) collapse to one
+/// `provider/model` row each in the CLI's own menu order (thinking effort
+/// folds in at send time), and the option matching the session's current
+/// value — the CLI's configured default — leads the list.
+pub(crate) fn models_from_config_options(session_result: &Value) -> Vec<ProbeModel> {
+    let model_option = session_result["configOptions"]
+        .as_array()
+        .and_then(|options| options.iter().find(|option| option["id"] == "model"));
+    let Some(options) = model_option
+        .and_then(|model| model["options"].as_array())
+        .filter(|options| !options.is_empty())
+    else {
+        return Vec::new();
+    };
+    let current_base = model_option
+        .and_then(|model| model["currentValue"].as_str())
+        .and_then(parse_model_option_value)
+        .map(|(base, _)| base);
+    let mut rows: Vec<ProbeModel> = Vec::new();
+    for option in options {
+        let Some((base, _variant)) = option["value"].as_str().and_then(parse_model_option_value)
+        else {
+            continue;
+        };
+        if rows.iter().any(|row| row.id == base) {
+            continue;
+        }
+        // The CLI's own label carries the variant suffix ("MiniMax-M3 ·
+        // thinking"); strip it and fall back to the id.
+        let name = option["name"]
+            .as_str()
+            .map(|name| name.split(" · ").next().unwrap_or(name).trim().to_string())
+            .filter(|name| !name.is_empty());
+        rows.push(ProbeModel {
+            is_default: current_base.as_deref() == Some(base.as_str()),
+            id: base,
+            name,
+        });
+    }
+    if let Some(index) = rows.iter().position(|row| row.is_default).filter(|i| *i > 0) {
+        let row = rows.remove(index);
+        rows.insert(0, row);
+    }
+    rows
+}
+
 /// Park one permission ask as a question card. `dispatch_event` stores the
 /// very `input` payload it emits, so the parked value carries both what the
 /// card renders (`questions`) and the context `answer_frame` needs to
@@ -920,6 +1029,36 @@ mod tests {
         );
         assert_eq!(parse_model_option_value("minimax/MiniMax-M3"), None);
         assert_eq!(parse_model_option_value("m:::v:"), None);
+    }
+
+    /// The live session/new menu (mcode 0.5.1): variant entries collapse to
+    /// one row per model, labels lose their variant suffix, and the CLI's
+    /// configured default leads — including providers the user added
+    /// themselves (a GLM channel lists as glm/…).
+    #[test]
+    fn probe_menu_collapses_variants_and_leads_with_the_default() {
+        let rows = models_from_config_options(&json!({
+            "sessionId": "mvs_a",
+            "configOptions": [
+                { "id": "permissionMode", "options": [] },
+                { "id": "model", "currentValue": "m:minimax:MiniMax-M2.7:v:thinking", "options": [
+                    { "value": "m:minimax:MiniMax-M3:v:", "name": "MiniMax-M3" },
+                    { "value": "m:minimax:MiniMax-M3:v:thinking", "name": "MiniMax-M3 · thinking" },
+                    { "value": "m:glm:glm-4.7:v:thinking", "name": "glm-4.7 · thinking" },
+                    { "value": "m:minimax:MiniMax-M2.7:v:thinking", "name": "MiniMax-M2.7 · thinking" },
+                ]},
+            ],
+        }));
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["minimax/MiniMax-M2.7", "minimax/MiniMax-M3", "glm/glm-4.7"]
+        );
+        assert!(rows[0].is_default);
+        assert!(!rows[1].is_default);
+        assert_eq!(rows[1].name.as_deref(), Some("MiniMax-M3"));
+        assert_eq!(rows[2].name.as_deref(), Some("glm-4.7"));
+        // A handshake without a model option yields an empty menu.
+        assert!(models_from_config_options(&json!({ "configOptions": [] })).is_empty());
     }
 
     fn permission_params() -> Value {
