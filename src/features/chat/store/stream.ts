@@ -16,6 +16,11 @@ export interface QueuedMessage {
   computerUse?: boolean;
 }
 
+/** One step of queue reorder. Directions are relative to the queue card,
+ *  which paints newest-first: "up" moves the row toward the top (= later in
+ *  send order), "down" toward the composer (= sooner). */
+export type QueueMoveDirection = "up" | "down";
+
 export interface SessionState {
   messages: Message[];
   /** Older delegation metadata kept outside the paginated message window. */
@@ -56,6 +61,10 @@ export interface SessionState {
   /** Set by interrupt(): the next "done" settles the turn but must not
    * auto-drain the queue — pressing stop is not "go on to the next". */
   interrupted: boolean;
+  /** Deferred plan the user explicitly reopened from its timeline card
+   *  (`"${planId}:${revision}"`): the approval dock mounts for it again.
+   *  Pure UI state — the backend record stays `deferred` either way. */
+  planReviewResume: string | null;
 }
 
 export const EMPTY_SESSION: SessionState = {
@@ -75,6 +84,7 @@ export const EMPTY_SESSION: SessionState = {
   compaction: null,
   queue: [],
   interrupted: false,
+  planReviewResume: null,
 };
 
 /** The model one session runs with, most specific first:
@@ -85,8 +95,8 @@ export const EMPTY_SESSION: SessionState = {
  *  4. the engine default (new chats, sessions with no history yet).
  *
  * Per session on purpose: two omp sessions may run different models, so the
- * picker, the send, and the stamped rows must all read the session's model —
- * an engine-wide default would make one session's pick leak into the other.
+ * picker and send must read the session's choice. Event-stamped rows instead
+ * prefer activeModel: the concrete model this turn ran, not its selector.
  */
 export function resolveSessionModel(
   tab: { engine: string; model?: string } | null | undefined,

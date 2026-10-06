@@ -1101,6 +1101,7 @@ mod tests {
                 reader_abort: Arc::new(std::sync::OnceLock::new()),
                 stdin: None,
                 questions: Arc::new(Mutex::new(HashMap::new())),
+                plans: Arc::new(Mutex::new(HashMap::new())),
             },
         );
         let core = TurnCore {
@@ -1108,6 +1109,7 @@ mod tests {
             registry: Arc::clone(&registry),
             engine_id: "minimax".to_string(),
             run_id: "test-run".to_string(),
+            db: None,
         };
         (core, registry, emitter)
     }

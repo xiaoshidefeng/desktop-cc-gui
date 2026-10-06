@@ -222,6 +222,7 @@ mod tests {
             session_id: None,
             workspace: std::env::temp_dir(),
             prompt: "run the tests".into(),
+            native_compact: false,
             images: vec![],
             model: Some("minimax/MiniMax-M2.7".into()),
             effort: Some("medium".into()),
@@ -230,6 +231,7 @@ mod tests {
             additional_dirs: vec![],
             provider_id: None,
             computer_use: None,
+            memory_bot: None,
             allowed_tools: None,
         }
     }
